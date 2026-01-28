@@ -18,6 +18,13 @@ export type UseCustomFetchOptions = {
   staleWhileRevalidate?: boolean;
 };
 
+type FetchState<T> = {
+  data: T | null;
+  isPending: boolean;
+  isError: boolean;
+  from: string;
+};
+
 export function useCustomFetch<T>(
   url: string,
   headers: Record<string, string>,
@@ -30,11 +37,14 @@ export function useCustomFetch<T>(
 
   const cacheKey = useMemo(() => buildCacheKey(url, headers), [url, headers]);
 
-  const [data, setData] = useState<T | null>(null);
-  const [isPending, setIsPending] = useState(false);
-  const [isError, setIsError] = useState(false);
-  const [from, setFrom] = useState("idle");
+  const [state, setState] = useState<FetchState<T>>({
+    data: null,
+    isPending: false,
+    isError: false,
+    from: "idle",
+  });
 
+  const { data, isPending, isError, from } = state;
   const abortRef = useRef<AbortController | null>(null);
 
   const clearCache = () => clearAllCache();
@@ -42,64 +52,89 @@ export function useCustomFetch<T>(
   useEffect(() => {
     if (!enabled) return;
 
-    abortRef.current?.abort();
-    abortRef.current = new AbortController();
+    abortRef.current?.abort(); // 이전 요청 취소 (항상 최신 요청만 유효)
+    abortRef.current = new AbortController(); // 새로운 AbortController 생성
 
+    // 변수로 고정
     const controller = abortRef.current;
     const signal = controller.signal;
 
-    setIsError(false);
-
-    // 1) Lookup
+    // 1) Lookup - reacCache에서 Cache 가져와
     const cached = readCache<T>(cacheKey);
     const now = Date.now();
 
+    setState((s) => ({
+      ...s,
+      isError: false,
+    }));
+
     // 2) Fresh면 네트워크 0
     if (cached && isFresh(cached, now)) {
-      setData(cached.data);
-      setIsPending(false);
-      setFrom("cache:fresh(no-network)");
+      setState({
+        data: cached.data,
+        isPending: false,
+        isError: false,
+        from: "cache:fresh(no-network)",
+      });
       return () => controller.abort();
     }
 
-    // 3) Stale이면 먼저 보여주기(SWR)
+    // 3) Stale이면 먼저 보여주기(SWR - 기본 true 설정)
+    // SWR (오래된(stale) 데이터라도 일단 보여주고, 뒤에서 최신 데이터로 다시 검증/갱신)
     if (cached) {
-      setData(cached.data);
-      setFrom("cache:stale(show-first)");
+      setState((s) => ({
+        ...s,
+        data: cached.data,
+        from: "cache:stale(show-first)",
+      }));
     }
 
-    // swr 끄면 stale이면 여기서 끝
     if (!swr && cached) {
-      setIsPending(false);
-      setFrom("cache:stale(no-revalidate)");
+      setState((s) => ({
+        ...s,
+        isPending: false,
+        from: "cache:stale(no-revalidate)",
+      }));
       return () => controller.abort();
     }
 
-    // 4) dedupe
+    // 4) dedupe (중복 요청 방지)
     const inflight = getInFlight<T>(cacheKey);
     if (inflight) {
-      setIsPending(true);
-      setFrom("dedupe:join-inflight");
+      setState((s) => ({
+        ...s,
+        isPending: true,
+        from: "dedupe:join-inflight",
+      }));
+
       inflight
         .then((d) => {
           if (!signal.aborted) {
-            setData(d);
-            setIsPending(false);
+            setState((s) => ({
+              ...s,
+              data: d,
+              isPending: false,
+              isError: false,
+            }));
           }
         })
         .catch(() => {
           if (!signal.aborted) {
-            setIsError(true);
-            setIsPending(false);
+            setState((s) => ({
+              ...s,
+              isError: true,
+              isPending: false,
+              from: "error",
+            }));
           }
         });
+
       return () => controller.abort();
     }
 
     // 5) 네트워크 + retry + validators
     const run = (async () => {
-      setIsPending(true);
-
+      setState((s) => ({ ...s, isPending: true }));
       const prev = cached?.meta;
 
       for (let attempt = 0; attempt <= retryOpt.retry; attempt++) {
@@ -125,9 +160,13 @@ export function useCustomFetch<T>(
           writeCache(cacheKey, nextEntry);
 
           if (!signal.aborted) {
-            setData(res.data);
-            setFrom(res.from);
-            setIsPending(false);
+            setState((s) => ({
+              ...s,
+              data: res.data,
+              isPending: false,
+              isError: false,
+              from: res.from,
+            }));
           }
           return res.data;
         } catch (e: any) {
@@ -135,20 +174,28 @@ export function useCustomFetch<T>(
 
           if (attempt === retryOpt.retry) {
             if (!signal.aborted) {
-              setIsError(true);
-              setIsPending(false);
-              setFrom("error");
+              setState((s) => ({
+                ...s,
+                isError: true,
+                isPending: false,
+                from: "error",
+              }));
             }
             throw e;
           }
 
           const delay = retryOpt.retryDelayMs(attempt);
-          setFrom(`retrying(${attempt + 1}/${retryOpt.retry}) in ${delay}ms`);
+          if (!signal.aborted) {
+            setState((s) => ({
+              ...s,
+              from: `retrying(${attempt + 1}/${retryOpt.retry}) in ${delay}ms`,
+            }));
+          }
           await sleep(delay, signal);
         }
       }
 
-      return null as any;
+      return null;
     })();
 
     setInFlight(cacheKey, run);
