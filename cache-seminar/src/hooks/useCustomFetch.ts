@@ -1,15 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { buildCacheKey } from "../lib/cacheKey";
-import {
-  clearAllCache,
-  isFresh,
-  readCache,
-  writeCache,
-  type CacheEntry,
-} from "../lib/cacheStorage";
+import { useMemo } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { fetchJsonWithValidators } from "../lib/http";
-import { defaultRetry, sleep, type RetryOptions } from "../lib/retry";
-import { getInFlight, setInFlight } from "../lib/inFlight";
+import { defaultRetry, type RetryOptions } from "../lib/retry";
 
 export type UseCustomFetchOptions = {
   staleTimeMs?: number;
@@ -18,194 +10,82 @@ export type UseCustomFetchOptions = {
   staleWhileRevalidate?: boolean;
 };
 
-type FetchState<T> = {
-  data: T | null;
-  isPending: boolean;
-  isError: boolean;
+type FetchResult<T> = {
+  data: T;
   from: string;
+  meta?: {
+    etag?: string;
+    lastModified?: string;
+  };
 };
 
-export function useCustomFetch<T>(
+export function useRQFetch<T>(
   url: string,
   headers: Record<string, string>,
   options: UseCustomFetchOptions = {},
 ) {
+  const queryClient = useQueryClient();
+
   const staleTimeMs = options.staleTimeMs ?? 3000;
   const retryOpt = options.retry ?? defaultRetry;
   const enabled = options.enabled ?? true;
   const swr = options.staleWhileRevalidate ?? true;
 
-  const cacheKey = useMemo(() => buildCacheKey(url, headers), [url, headers]);
+  // React Query의 queryKey는 "캐시 키" 역할
+  const queryKey = useMemo(
+    () => ["products", url, headers["accept-language"]],
+    [url, headers],
+  );
 
-  const [state, setState] = useState<FetchState<T>>({
-    data: null,
-    isPending: false,
-    isError: false,
-    from: "idle",
+  const query = useQuery<FetchResult<T>, Error>({
+    queryKey,
+    enabled,
+    staleTime: staleTimeMs,
+
+    // swr=false면 stale이어도 자동 갱신을 최소화하는 방향으로 매핑
+    // (완전히 "stale이면 끝"을 동일하게 만들긴 어렵고, 아래 옵션 조합이 가장 유사)
+    refetchOnMount: swr ? "always" : false,
+    refetchOnWindowFocus: swr,
+    refetchOnReconnect: swr,
+
+    // stale 데이터 유지(= 먼저 보여주기) 느낌을 위해
+    placeholderData: (prev) => prev ?? undefined,
+
+    // retry 매핑
+    retry: retryOpt.retry,
+    retryDelay: (attemptIndex) => retryOpt.retryDelayMs(attemptIndex),
+
+    // queryFn: AbortSignal을 받아서 취소 가능
+    queryFn: async ({ signal }) => {
+      const prevCache = queryClient.getQueryData<FetchResult<T>>(queryKey);
+      const prev = prevCache?.meta;
+
+      const res = await fetchJsonWithValidators<T>({
+        url,
+        headers: normalizeLower(headers),
+        signal,
+        prev,
+        fallback: () => null,
+      });
+
+      return {
+        data: res.data,
+        from: res.from,
+        meta: {
+          etag: res.responseHeaders["etag"],
+          lastModified: res.responseHeaders["last-modified"],
+        },
+      };
+    },
   });
 
-  const { data, isPending, isError, from } = state;
-  const abortRef = useRef<AbortController | null>(null);
-
-  const clearCache = () => clearAllCache();
-
-  useEffect(() => {
-    if (!enabled) return;
-
-    abortRef.current?.abort(); // 이전 요청 취소 (항상 최신 요청만 유효)
-    abortRef.current = new AbortController(); // 새로운 AbortController 생성
-
-    // 변수로 고정
-    const controller = abortRef.current;
-    const signal = controller.signal;
-
-    // 1) Lookup - reacCache에서 Cache 가져와
-    const cached = readCache<T>(cacheKey);
-    const now = Date.now();
-
-    setState((s) => ({
-      ...s,
-      isError: false,
-    }));
-
-    // 2) Fresh면 네트워크 0
-    if (cached && isFresh(cached, now)) {
-      setState({
-        data: cached.data,
-        isPending: false,
-        isError: false,
-        from: "cache:fresh(no-network)",
-      });
-      return () => controller.abort();
-    }
-
-    // 3) Stale이면 먼저 보여주기(SWR - 기본 true 설정)
-    // SWR (오래된(stale) 데이터라도 일단 보여주고, 뒤에서 최신 데이터로 다시 검증/갱신)
-    if (cached) {
-      setState((s) => ({
-        ...s,
-        data: cached.data,
-        from: "cache:stale(show-first)",
-      }));
-    }
-
-    if (!swr && cached) {
-      setState((s) => ({
-        ...s,
-        isPending: false,
-        from: "cache:stale(no-revalidate)",
-      }));
-      return () => controller.abort();
-    }
-
-    // 4) dedupe (중복 요청 방지)
-    const inflight = getInFlight<T>(cacheKey);
-    if (inflight) {
-      setState((s) => ({
-        ...s,
-        isPending: true,
-        from: "dedupe:join-inflight",
-      }));
-
-      inflight
-        .then((d) => {
-          if (!signal.aborted) {
-            setState((s) => ({
-              ...s,
-              data: d,
-              isPending: false,
-              isError: false,
-            }));
-          }
-        })
-        .catch(() => {
-          if (!signal.aborted) {
-            setState((s) => ({
-              ...s,
-              isError: true,
-              isPending: false,
-              from: "error",
-            }));
-          }
-        });
-
-      return () => controller.abort();
-    }
-
-    // 5) 네트워크 + retry + validators
-    const run = (async () => {
-      setState((s) => ({ ...s, isPending: true }));
-      const prev = cached?.meta;
-
-      for (let attempt = 0; attempt <= retryOpt.retry; attempt++) {
-        try {
-          const res = await fetchJsonWithValidators<T>({
-            url,
-            headers: normalizeLower(headers),
-            signal,
-            prev,
-            fallback: () => readCache<T>(cacheKey)?.data ?? null,
-          });
-
-          const nextEntry: CacheEntry<T> = {
-            data: res.data,
-            cachedAt: Date.now(),
-            staleTimeMs,
-            meta: {
-              etag: res.responseHeaders["etag"],
-              lastModified: res.responseHeaders["last-modified"],
-            },
-          };
-
-          writeCache(cacheKey, nextEntry);
-
-          if (!signal.aborted) {
-            setState((s) => ({
-              ...s,
-              data: res.data,
-              isPending: false,
-              isError: false,
-              from: res.from,
-            }));
-          }
-          return res.data;
-        } catch (e: any) {
-          if (e?.name === "AbortError" || signal.aborted) throw e;
-
-          if (attempt === retryOpt.retry) {
-            if (!signal.aborted) {
-              setState((s) => ({
-                ...s,
-                isError: true,
-                isPending: false,
-                from: "error",
-              }));
-            }
-            throw e;
-          }
-
-          const delay = retryOpt.retryDelayMs(attempt);
-          if (!signal.aborted) {
-            setState((s) => ({
-              ...s,
-              from: `retrying(${attempt + 1}/${retryOpt.retry}) in ${delay}ms`,
-            }));
-          }
-          await sleep(delay, signal);
-        }
-      }
-
-      return null;
-    })();
-
-    setInFlight(cacheKey, run);
-
-    return () => {
-      controller.abort();
-    };
-  }, [url, cacheKey, staleTimeMs, enabled]);
-
-  return { data, isPending, isError, from, clearCache };
+  return {
+    data: query.data?.data ?? null,
+    isPending: query.isPending,
+    isError: query.isError,
+    from: query.data?.from ?? (query.isFetching ? "fetching" : "idle"),
+    refetch: query.refetch,
+  };
 }
 
 function normalizeLower(headers: Record<string, string>) {
