@@ -81,7 +81,7 @@ export default function App() {
           pending: {String(user.isPending)} / error: {String(user.isError)}
         </div>
         <pre style={{ background: "#f7f7f7", padding: 12, color: "#111" }}>
-          {JSON.stringify(products.data, null, 2)}
+          {JSON.stringify(user.data, null, 2)}
         </pre>
       </Panel>
     </div>
