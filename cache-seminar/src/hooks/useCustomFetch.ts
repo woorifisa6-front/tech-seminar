@@ -14,7 +14,6 @@ import { getInFlight, setInFlight } from "../lib/inFlight";
 export type UseCustomFetchOptions = {
   staleTimeMs?: number;
   retry?: RetryOptions;
-  enabled?: boolean;
   staleWhileRevalidate?: boolean;
 };
 
@@ -25,7 +24,6 @@ export function useCustomFetch<T>(
 ) {
   const staleTimeMs = options.staleTimeMs ?? 3000;
   const retryOpt = options.retry ?? defaultRetry;
-  const enabled = options.enabled ?? true;
   const swr = options.staleWhileRevalidate ?? true;
 
   const cacheKey = useMemo(() => buildCacheKey(url, headers), [url, headers]);
@@ -40,8 +38,6 @@ export function useCustomFetch<T>(
   const clearCache = () => clearAllCache();
 
   useEffect(() => {
-    if (!enabled) return;
-
     abortRef.current?.abort();
     abortRef.current = new AbortController();
 
@@ -50,11 +46,11 @@ export function useCustomFetch<T>(
 
     setIsError(false);
 
-    // 1) Lookup
+    // 1) Cache lookup
     const cached = readCache<T>(cacheKey);
     const now = Date.now();
 
-    // 2) Fresh면 네트워크 0
+    // 2) Fresh → 네트워크 요청 안 함
     if (cached && isFresh(cached, now)) {
       setData(cached.data);
       setIsPending(false);
@@ -62,13 +58,13 @@ export function useCustomFetch<T>(
       return () => controller.abort();
     }
 
-    // 3) Stale이면 먼저 보여주기(SWR)
+    // 3) Stale → 먼저 보여주기 (SWR)
     if (cached) {
       setData(cached.data);
       setFrom("cache:stale(show-first)");
     }
 
-    // swr 끄면 stale이면 여기서 끝
+    // SWR 끄면 여기서 종료
     if (!swr && cached) {
       setIsPending(false);
       setFrom("cache:stale(no-revalidate)");
@@ -99,7 +95,6 @@ export function useCustomFetch<T>(
     // 5) 네트워크 + retry + validators
     const run = (async () => {
       setIsPending(true);
-
       const prev = cached?.meta;
 
       for (let attempt = 0; attempt <= retryOpt.retry; attempt++) {
@@ -147,8 +142,6 @@ export function useCustomFetch<T>(
           await sleep(delay, signal);
         }
       }
-
-      return null as any;
     })();
 
     setInFlight(cacheKey, run);
@@ -156,14 +149,15 @@ export function useCustomFetch<T>(
     return () => {
       controller.abort();
     };
-  }, [url, cacheKey, staleTimeMs, enabled]);
+  }, [url, cacheKey, staleTimeMs]);
 
   return { data, isPending, isError, from, clearCache };
 }
 
 function normalizeLower(headers: Record<string, string>) {
   const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(headers))
+  for (const [k, v] of Object.entries(headers)) {
     out[k.toLowerCase()] = String(v);
+  }
   return out;
 }
