@@ -1,0 +1,19 @@
+{
+  "products": [
+    {
+      "id": 101,
+      "name": "Camera",
+      "price": 1000
+    },
+    {
+      "id": 102,
+      "name": "Tripod",
+      "price": 120
+    }
+  ],
+  "user": {
+    "id": 1,
+    "name": "Alice-447",
+    "role": "USER"
+  }
+}
