@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { fetchJsonWithValidators } from "../lib/http";
 import { defaultRetry, type RetryOptions } from "../lib/retry";
+import { buildCacheKey } from "../lib/cacheKey";
 
 export type UseCustomFetchOptions = {
   staleTimeMs?: number;
@@ -33,7 +33,7 @@ export function useRQFetch<T>(
 
   // React Query의 queryKey는 "캐시 키" 역할
   const queryKey = useMemo(
-    () => ["products", url, headers["accept-language"]],
+    () => ["httpcache", buildCacheKey(url, headers)] as const,
     [url, headers],
   );
 
@@ -43,8 +43,7 @@ export function useRQFetch<T>(
     staleTime: staleTimeMs,
 
     // swr=false면 stale이어도 자동 갱신을 최소화하는 방향으로 매핑
-    // (완전히 "stale이면 끝"을 동일하게 만들긴 어렵고, 아래 옵션 조합이 가장 유사)
-    refetchOnMount: swr ? "always" : false,
+    refetchOnMount: swr ? true : false,
     refetchOnWindowFocus: swr,
     refetchOnReconnect: swr,
 
@@ -60,20 +59,30 @@ export function useRQFetch<T>(
       const prevCache = queryClient.getQueryData<FetchResult<T>>(queryKey);
       const prev = prevCache?.meta;
 
-      const res = await fetchJsonWithValidators<T>({
-        url,
-        headers: normalizeLower(headers),
+      const res = await fetch(url, {
+        method: "GET",
+        cache: "no-store",
+        headers: {
+          ...normalizeLower(headers),
+          ...(prev?.etag ? { "if-none-match": prev.etag } : {}),
+          ...(prev?.lastModified
+            ? { "if-modified-since": prev.lastModified }
+            : {}),
+        },
         signal,
-        prev,
-        fallback: () => null,
       });
 
+      if (res.status === 304) {
+        return { data: prevCache!.data, from: "304", meta: prev };
+      }
+
+      const data = await res.json();
       return {
-        data: res.data,
-        from: res.from,
+        data,
+        from: "200",
         meta: {
-          etag: res.responseHeaders["etag"],
-          lastModified: res.responseHeaders["last-modified"],
+          etag: res.headers.get("etag") ?? undefined,
+          lastModified: res.headers.get("last-modified") ?? undefined,
         },
       };
     },
