@@ -1,4 +1,4 @@
-# 🧠 프론트엔드에서의 캐싱 (Frontend Caching)
+# 📦 프론트엔드에서의 캐싱 (Frontend Caching)
 
 > 프론트엔드 캐싱을 비롯해, **Custom Cache vs TanStack Query**를 바탕으로 캐싱 메커니즘을 이해한다.
 
@@ -77,7 +77,9 @@ stale 상태라도 UX를 위해:
 
 ---
 
-## 🧩 구현 내용
+<img width="563" height="318" alt="스크린샷 2026-02-02 오후 3 54 16" src="https://github.com/user-attachments/assets/b1e4f112-a613-4ad6-8f08-ca2d28335ac4" />
+
+## 구현 내용
 
 ### 1️⃣ Custom Cache 직접 구현
 - In-memory 캐시 저장소 구현
